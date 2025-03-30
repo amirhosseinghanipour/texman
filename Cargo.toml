@@ -9,6 +9,7 @@ repository = "https://github.com/amirhosseinghanipour/texman"
 documentation = "https://docs.rs/texman/0.1.0"
 categories = ["latex"]
 readme = "README.md"
+description = "A Rust-based package manager for LaTeX"
 
 [dependencies]
 anyhow = "1.0.97"
