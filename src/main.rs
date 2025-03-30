@@ -5,9 +5,12 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc, Duration};
 use std::fs;
 use futures::future::join_all;
+use futures::StreamExt;
 use xz2::read::XzDecoder;
 use tar;
 use rusqlite::{Connection, params, OptionalExtension};
+use indicatif::{ProgressBar, ProgressStyle};
+use std::io::Write;
 
 #[derive(Parser)]
 #[command(name = "texman", about = "A Rust-based LaTeX package manager", version = "0.1.0")]
@@ -27,6 +30,15 @@ enum Commands {
     List,
     Remove {
         package: String,
+    },
+    Info {
+        package: String,
+    },
+    Backup {
+        name: String,
+    },
+    Restore {
+        name: String,
     },
     Profile {
         #[command(subcommand)]
@@ -78,6 +90,18 @@ async fn main() -> anyhow::Result<()> {
             log::info!("Removing package: {}", package);
             remove_package(&package)?;
         }
+        Commands::Info { package } => {
+            log::info!("Showing info for package: {}", package);
+            info_package(&package, &tlpdb)?;
+        }
+        Commands::Backup { name } => {
+            log::info!("Backing up active profile to '{}'", name);
+            backup_profile(&name)?;
+        }
+        Commands::Restore { name } => {
+            log::info!("Restoring active profile from backup '{}'", name);
+            restore_profile(&name)?;
+        }
         Commands::Profile { action } => match action {
             ProfileAction::Create { name } => create_profile(&name)?,
             ProfileAction::Switch { name } => switch_profile(&name)?,
@@ -96,6 +120,16 @@ fn init_db(texman_dir: &PathBuf) -> anyhow::Result<Connection> {
             name TEXT NOT NULL,
             revision TEXT NOT NULL,
             PRIMARY KEY (profile, name)
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS backups (
+            backup_name TEXT NOT NULL,
+            profile TEXT NOT NULL,
+            name TEXT NOT NULL,
+            revision TEXT NOT NULL,
+            PRIMARY KEY (backup_name, name)
         )",
         [],
     )?;
@@ -139,7 +173,25 @@ async fn fetch_tlpdb() -> anyhow::Result<HashMap<String, Package>> {
 async fn fetch_tlpdb_text() -> anyhow::Result<String> {
     let url = "http://mirror.ctan.org/systems/texlive/tlnet/tlpkg/texlive.tlpdb";
     let response = reqwest::get(url).await?;
-    let tlpdb_text = response.text().await?;
+    let content_length = response.content_length().unwrap_or(0);
+    let pb = ProgressBar::new(content_length);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] {bar:40.cyan/blue} {bytes}/{total_bytes} ({bytes_per_sec}, {eta}")?
+            .progress_chars("##-")
+    );
+
+    let mut buffer = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        buffer.extend_from_slice(&chunk);
+        pb.inc(chunk.len() as u64);
+    }
+    pb.finish_with_message("Downloaded TLPDB");
+
+    let tlpdb_text = String::from_utf8(buffer)
+        .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in TLPDB: {}", e))?;
     log::debug!("Fetched TLPDB ({} bytes)", tlpdb_text.len());
     Ok(tlpdb_text)
 }
@@ -250,10 +302,10 @@ fn resolve_dependencies(
     resolved: &mut Vec<String>,
     visited: &mut Vec<String>,
 ) -> anyhow::Result<()> {
-    let pkg = tlpdb.get(package).ok_or_else(|| anyhow::anyhow!("Package {} not found", package))?;
+    let pkg = tlpdb.get(package).ok_or_else(|| anyhow::anyhow!("Package '{}' not found in TLPDB", package))?;
 
     if visited.contains(&pkg.name) && !resolved.contains(&pkg.name) {
-        anyhow::bail!("Circular dependency detected involving {}", pkg.name);
+        anyhow::bail!("Circular dependency detected involving '{}'", pkg.name);
     }
 
     visited.push(pkg.name.clone());
@@ -279,7 +331,7 @@ async fn download_package(pkg: &Package, texman_dir: &PathBuf) -> anyhow::Result
     let platform_suffix = match (platform, os) {
         ("x86_64", "linux") => "x86_64-linux",
         ("x86_64", "macos") => "x86_64-darwin",
-        _ => "", 
+        _ => "",
     };
 
     let mut archive_name = format!("{}.tar.xz", pkg.name);
@@ -311,9 +363,25 @@ async fn download_package(pkg: &Package, texman_dir: &PathBuf) -> anyhow::Result
 
     let download_path = texman_dir.join(&archive_name);
     log::info!("Downloading {} r{} from {}", pkg.name, pkg.revision, url);
-    let response = reqwest::get(&url).await?;
-    let bytes = response.bytes().await?;
-    std::fs::write(&download_path, bytes)?;
+    let response = reqwest::get(&url).await
+        .map_err(|e| anyhow::anyhow!("Failed to download {}: {}", url, e))?;
+    let content_length = response.content_length().unwrap_or(0);
+    let pb = ProgressBar::new(content_length);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] {bar:40.green/yellow} {bytes}/{total_bytes} ({bytes_per_sec}, {eta}")?
+            .progress_chars("##-")
+    );
+
+    let mut file = File::create(&download_path)?;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        file.write_all(&chunk)?;
+        pb.inc(chunk.len() as u64);
+    }
+    pb.finish_with_message(format!("Downloaded {}", pkg.name));
+
     Ok(download_path)
 }
 
@@ -329,6 +397,11 @@ async fn install_package(package: &str, profile: &str, tlpdb: &HashMap<String, P
     let mut to_install = Vec::new();
     let mut visited = Vec::new();
     resolve_dependencies(package, tlpdb, &mut to_install, &mut visited)?;
+
+    if to_install.is_empty() {
+        log::info!("No packages to install ({} already resolved)", package);
+        return Ok(());
+    }
     log::info!("Packages to install: {:?}", to_install);
 
     let packages: Vec<Package> = to_install
@@ -348,9 +421,11 @@ async fn install_package(package: &str, profile: &str, tlpdb: &HashMap<String, P
     let download_results = join_all(download_tasks).await;
     let download_paths: Vec<PathBuf> = download_results
         .into_iter()
-        .collect::<Result<Vec<_>, _>>()?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("Task failed: {}", e))?
         .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("Download failed: {}", e))?;
 
     for (pkg, download_path) in packages.iter().zip(download_paths.iter()) {
         let store_path = profile_dir.join(format!("{}-r{}", pkg.name, pkg.revision));
@@ -360,7 +435,8 @@ async fn install_package(package: &str, profile: &str, tlpdb: &HashMap<String, P
         let tar_xz = File::open(download_path)?;
         let tar = XzDecoder::new(tar_xz);
         let mut archive = tar::Archive::new(tar);
-        archive.unpack(&store_path)?;
+        archive.unpack(&store_path)
+            .map_err(|e| anyhow::anyhow!("Failed to unpack {}: {}", pkg.name, e))?;
 
         std::fs::remove_file(download_path)?;
 
@@ -375,47 +451,6 @@ async fn install_package(package: &str, profile: &str, tlpdb: &HashMap<String, P
     if !active_path.exists() {
         std::os::unix::fs::symlink(&profile_dir, &active_path)?;
         log::info!("Set {} as active profile", profile);
-    }
-
-    Ok(())
-}
-
-fn remove_package(package: &str) -> anyhow::Result<()> {
-    let texman_dir = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?
-        .join(".texman");
-    let active_path = texman_dir.join("active");
-
-    if !active_path.exists() {
-        anyhow::bail!("No active profile set. Install a package or switch to a profile first.");
-    }
-
-    let conn = init_db(&texman_dir)?;
-    let active_dir = fs::canonicalize(&active_path)?;
-    let active_profile = active_path.read_link()?
-        .file_name()
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_string();
-
-    let mut stmt = conn.prepare("SELECT revision FROM installed_packages WHERE profile = ?1 AND name = ?2")?;
-    let revision: Option<String> = stmt.query_row(params![active_profile, package], |row| row.get(0)).optional()?;
-
-    if let Some(revision) = revision {
-        let store_path = active_dir.join(format!("{}-r{}", package, revision));
-        if store_path.exists() {
-            fs::remove_dir_all(&store_path)?;
-            log::info!("Removed files for {} r{}", package, revision);
-        }
-
-        conn.execute(
-            "DELETE FROM installed_packages WHERE profile = ?1 AND name = ?2",
-            params![active_profile, package],
-        )?;
-        log::info!("Removed {} from profile '{}'", package, active_profile);
-    } else {
-        log::warn!("Package {} not found in profile '{}'", package, active_profile);
     }
 
     Ok(())
@@ -449,8 +484,10 @@ async fn update_packages(tlpdb: &HashMap<String, Package>) -> anyhow::Result<()>
     for row in rows {
         let (pkg_name, current_revision) = row?;
         if let Some(latest_pkg) = tlpdb.get(&pkg_name) {
-            let current_rev: u32 = current_revision.parse()?;
-            let latest_rev: u32 = latest_pkg.revision.parse()?;
+            let current_rev: u32 = current_revision.parse()
+                .map_err(|e| anyhow::anyhow!("Invalid revision {} for {}: {}", current_revision, pkg_name, e))?;
+            let latest_rev: u32 = latest_pkg.revision.parse()
+                .map_err(|e| anyhow::anyhow!("Invalid revision {} for {}: {}", latest_pkg.revision, pkg_name, e))?;
             if latest_rev > current_rev {
                 log::info!("Found update for {}: r{} -> r{}", pkg_name, current_revision, latest_pkg.revision);
                 to_update.push(latest_pkg.clone());
@@ -475,9 +512,11 @@ async fn update_packages(tlpdb: &HashMap<String, Package>) -> anyhow::Result<()>
     let download_results = join_all(download_tasks).await;
     let download_paths: Vec<PathBuf> = download_results
         .into_iter()
-        .collect::<Result<Vec<_>, _>>()?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("Task failed during update: {}", e))?
         .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("Download failed during update: {}", e))?;
 
     for (pkg, download_path) in to_update.iter().zip(download_paths.iter()) {
         let store_path = active_dir.join(format!("{}-r{}", pkg.name, pkg.revision));
@@ -487,7 +526,8 @@ async fn update_packages(tlpdb: &HashMap<String, Package>) -> anyhow::Result<()>
         let tar_xz = File::open(download_path)?;
         let tar = XzDecoder::new(tar_xz);
         let mut archive = tar::Archive::new(tar);
-        archive.unpack(&store_path)?;
+        archive.unpack(&store_path)
+            .map_err(|e| anyhow::anyhow!("Failed to unpack {}: {}", pkg.name, e))?;
 
         std::fs::remove_file(download_path)?;
 
@@ -539,6 +579,67 @@ fn list_packages() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn remove_package(package: &str) -> anyhow::Result<()> {
+    let texman_dir = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?
+        .join(".texman");
+    let active_path = texman_dir.join("active");
+
+    if !active_path.exists() {
+        anyhow::bail!("No active profile set. Install a package or switch to a profile first.");
+    }
+
+    let conn = init_db(&texman_dir)?;
+    let active_dir = fs::canonicalize(&active_path)?;
+    let active_profile = active_path.read_link()?
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let mut stmt = conn.prepare("SELECT revision FROM installed_packages WHERE profile = ?1 AND name = ?2")?;
+    let revision: Option<String> = stmt.query_row(params![active_profile, package], |row| row.get(0)).optional()?;
+
+    if let Some(revision) = revision {
+        let store_path = active_dir.join(format!("{}-r{}", package, revision));
+        if store_path.exists() {
+            fs::remove_dir_all(&store_path)?;
+            log::info!("Removed files for {} r{}", package, revision);
+        }
+
+        conn.execute(
+            "DELETE FROM installed_packages WHERE profile = ?1 AND name = ?2",
+            params![active_profile, package],
+        )?;
+        log::info!("Removed {} from profile '{}'", package, active_profile);
+    } else {
+        log::warn!("Package {} not found in profile '{}'", package, active_profile);
+    }
+
+    Ok(())
+}
+
+fn info_package(package: &str, tlpdb: &HashMap<String, Package>) -> anyhow::Result<()> {
+    let pkg = tlpdb.get(package).ok_or_else(|| anyhow::anyhow!("Package '{}' not found in TLPDB", package))?;
+    
+    println!("Package: {}", pkg.name);
+    println!("Revision: {}", pkg.revision);
+    println!("Default URL: {}", pkg.url);
+    let deps_str = if pkg.depends.is_empty() { "None".to_string() } else { pkg.depends.join(", ") };
+    println!("Dependencies: {}", deps_str);
+    println!("Runfiles ({}):", pkg.runfiles.len());
+    for file in &pkg.runfiles {
+        println!("  {}", file);
+    }
+    println!("Binfiles ({}):", pkg.binfiles.len());
+    for file in &pkg.binfiles {
+        println!("  {}", file);
+    }
+
+    Ok(())
+}
+
 fn create_profile(name: &str) -> anyhow::Result<()> {
     let texman_dir = dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?
@@ -557,7 +658,7 @@ fn switch_profile(name: &str) -> anyhow::Result<()> {
     let active_path = texman_dir.join("active");
 
     if !profile_path.exists() {
-        anyhow::bail!("Profile {} does not exist", name);
+        anyhow::bail!("Profile '{}' does not exist. Use 'profile create {}' to create it.", name, name);
     }
 
     if active_path.exists() {
@@ -565,5 +666,123 @@ fn switch_profile(name: &str) -> anyhow::Result<()> {
     }
     std::os::unix::fs::symlink(&profile_path, &active_path)?;
     log::info!("Switched to profile: {}", name);
+    Ok(())
+}
+
+fn copy_recursively(source: &PathBuf, destination: &PathBuf) -> anyhow::Result<()> {
+    if source.is_dir() {
+        fs::create_dir_all(destination)?;
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            let src_path = entry.path();
+            let dest_path = destination.join(entry.file_name());
+            copy_recursively(&src_path, &dest_path)?;
+        }
+    } else {
+        fs::copy(source, destination)?;
+    }
+    Ok(())
+}
+
+fn backup_profile(name: &str) -> anyhow::Result<()> {
+    let texman_dir = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?
+        .join(".texman");
+    let active_path = texman_dir.join("active");
+
+    if !active_path.exists() {
+        anyhow::bail!("No active profile set. Install a package or switch to a profile first.");
+    }
+
+    let active_dir = fs::canonicalize(&active_path)?;
+    let active_profile = active_path.read_link()?
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let backup_dir = texman_dir.join("backups").join(name);
+    std::fs::create_dir_all(&backup_dir)?;
+
+    for entry in fs::read_dir(&active_dir)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dest_path = backup_dir.join(entry.file_name());
+        copy_recursively(&src_path, &dest_path)?;
+    }
+
+    let conn = init_db(&texman_dir)?;
+    let mut stmt = conn.prepare("SELECT name, revision FROM installed_packages WHERE profile = ?1")?;
+    let rows = stmt.query_map(params![active_profile], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (pkg_name, revision) = row?;
+        conn.execute(
+            "INSERT INTO backups (backup_name, profile, name, revision) VALUES (?1, ?2, ?3, ?4)",
+            params![name, active_profile, pkg_name, revision],
+        )?;
+    }
+
+    log::info!("Created backup '{}' for profile '{}'", name, active_profile);
+    Ok(())
+}
+
+fn restore_profile(name: &str) -> anyhow::Result<()> {
+    let texman_dir = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?
+        .join(".texman");
+    let active_path = texman_dir.join("active");
+    let backup_dir = texman_dir.join("backups").join(name);
+
+    if !active_path.exists() {
+        anyhow::bail!("No active profile set. Install a package or switch to a profile first.");
+    }
+    if !backup_dir.exists() {
+        anyhow::bail!("Backup '{}' does not exist.", name);
+    }
+
+    let active_dir = fs::canonicalize(&active_path)?;
+    let active_profile = active_path.read_link()?
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    for entry in fs::read_dir(&active_dir)? {
+        let entry = entry?;
+        if entry.path().is_dir() {
+            fs::remove_dir_all(entry.path())?;
+        } else {
+            fs::remove_file(entry.path())?;
+        }
+    }
+
+    for entry in fs::read_dir(&backup_dir)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dest_path = active_dir.join(entry.file_name());
+        copy_recursively(&src_path, &dest_path)?;
+    }
+
+    let conn = init_db(&texman_dir)?;
+    conn.execute(
+        "DELETE FROM installed_packages WHERE profile = ?1",
+        params![active_profile],
+    )?;
+    let mut stmt = conn.prepare("SELECT name, revision FROM backups WHERE backup_name = ?1")?;
+    let rows = stmt.query_map(params![name], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (pkg_name, revision) = row?;
+        conn.execute(
+            "INSERT INTO installed_packages (profile, name, revision) VALUES (?1, ?2, ?3)",
+            params![active_profile, pkg_name, revision],
+        )?;
+    }
+
+    log::info!("Restored profile '{}' from backup '{}'", active_profile, name);
     Ok(())
 }
