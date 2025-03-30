@@ -40,6 +40,9 @@ enum Commands {
     Restore {
         name: String,
     },
+    Search {
+        term: String,
+    },
     Profile {
         #[command(subcommand)]
         action: ProfileAction,
@@ -101,6 +104,10 @@ async fn main() -> anyhow::Result<()> {
         Commands::Restore { name } => {
             log::info!("Restoring active profile from backup '{}'", name);
             restore_profile(&name)?;
+        }
+        Commands::Search { term } => {
+            log::info!("Searching for packages matching '{}'", term);
+            search_packages(&term, &tlpdb)?;
         }
         Commands::Profile { action } => match action {
             ProfileAction::Create { name } => create_profile(&name)?,
@@ -197,99 +204,76 @@ async fn fetch_tlpdb_text() -> anyhow::Result<String> {
 }
 
 fn parse_tlpdb(tlpdb_text: &str) -> anyhow::Result<HashMap<String, Package>> {
-    let mut packages = HashMap::new();
-    let mut current_pkg: Option<(String, Vec<String>, String, Vec<String>, Vec<String>)> = None;
-
+    let mut packages = HashMap::with_capacity(9000); 
+    let mut current_pkg: Option<Package> = None;
     let mut in_runfiles = false;
     let mut in_binfiles = false;
 
     for line in tlpdb_text.lines() {
-        if line.is_empty() && current_pkg.is_some() {
-            let (name, depends, revision, runfiles, binfiles) = current_pkg.take().unwrap();
-            let url = format!(
-                "http://mirror.ctan.org/systems/texlive/tlnet/archive/{}.tar.xz",
-                name
-            );
-            packages.insert(
-                name.clone(),
-                Package {
-                    name,
-                    revision,
-                    url,
-                    depends,
-                    runfiles,
-                    binfiles,
-                },
-            );
-            in_runfiles = false;
-            in_binfiles = false;
-        } else if line.starts_with("name ") {
-            if let Some((name, _, _, _, _)) = current_pkg.take() {
-                let url = format!(
-                    "http://mirror.ctan.org/systems/texlive/tlnet/archive/{}.tar.xz",
-                    name
-                );
-                packages.insert(
-                    name.clone(),
-                    Package {
-                        name,
-                        revision: "unknown".to_string(),
-                        url,
-                        depends: vec![],
-                        runfiles: vec![],
-                        binfiles: vec![],
-                    },
-                );
+        let line = line.trim();
+        if line.is_empty() {
+            if let Some(pkg) = current_pkg.take() {
+                packages.insert(pkg.name.clone(), pkg);
             }
-            let name = line.strip_prefix("name ").unwrap().to_string();
-            current_pkg = Some((name, vec![], "unknown".to_string(), vec![], vec![]));
             in_runfiles = false;
             in_binfiles = false;
-        } else if let Some((_, depends, revision, runfiles, binfiles)) = &mut current_pkg {
-            if line == "runfiles" {
-                in_runfiles = true;
-                in_binfiles = false;
-            } else if line == "binfiles" {
-                in_runfiles = false;
-                in_binfiles = true;
-            } else if line.starts_with("depends ") {
-                let deps = line.strip_prefix("depends ").unwrap();
-                if !deps.is_empty() {
-                    depends.extend(deps.split(',').map(|s| s.trim().to_string()));
+            continue;
+        }
+
+        if line.starts_with("name ") {
+            if let Some(pkg) = current_pkg.take() {
+                packages.insert(pkg.name.clone(), pkg);
+            }
+            let name = line[5..].to_string();
+            current_pkg = Some(Package {
+                name: name.clone(),
+                revision: "unknown".to_string(),
+                url: format!("http://mirror.ctan.org/systems/texlive/tlnet/archive/{}.tar.xz", name),
+                depends: Vec::new(),
+                runfiles: Vec::new(),
+                binfiles: Vec::new(),
+            });
+            in_runfiles = false;
+            in_binfiles = false;
+        } else if let Some(ref mut pkg) = current_pkg {
+            match line {
+                "runfiles" => {
+                    in_runfiles = true;
+                    in_binfiles = false;
                 }
-                in_runfiles = false;
-                in_binfiles = false;
-            } else if line.starts_with("revision ") {
-                *revision = line.strip_prefix("revision ").unwrap().to_string();
-                in_runfiles = false;
-                in_binfiles = false;
-            } else if in_runfiles && line.starts_with(" ") {
-                runfiles.push(line.trim().to_string());
-            } else if in_binfiles && line.starts_with(" ") {
-                binfiles.push(line.trim().to_string());
-            } else {
-                in_runfiles = false;
-                in_binfiles = false;
+                "binfiles" => {
+                    in_runfiles = false;
+                    in_binfiles = true;
+                }
+                _ if line.starts_with("depends ") => {
+                    let deps = &line[8..];
+                    if !deps.is_empty() {
+                        pkg.depends.extend(deps.split(',').map(|s| s.trim().to_string()));
+                    }
+                    in_runfiles = false;
+                    in_binfiles = false;
+                }
+                _ if line.starts_with("revision ") => {
+                    pkg.revision = line[9..].to_string();
+                    in_runfiles = false;
+                    in_binfiles = false;
+                }
+                _ if in_runfiles && line.starts_with(' ') => {
+                    pkg.runfiles.push(line.trim_start().to_string());
+                }
+                _ if in_binfiles && line.starts_with(' ') => {
+                    pkg.binfiles.push(line.trim_start().to_string());
+                }
+                _ => {
+                    in_runfiles = false;
+                    in_binfiles = false;
+                }
             }
         }
     }
 
-    if let Some((name, depends, revision, runfiles, binfiles)) = current_pkg {
-        let url = format!(
-            "http://mirror.ctan.org/systems/texlive/tlnet/archive/{}.tar.xz",
-            name
-        );
-        packages.insert(
-            name.clone(),
-            Package {
-                name,
-                revision,
-                url,
-                depends,
-                runfiles,
-                binfiles,
-            },
-        );
+    if let Some(pkg) = current_pkg {
+        packages.insert(pkg.name.clone(), pkg);
     }
 
     log::info!("Parsed {} packages from TLPDB", packages.len());
@@ -635,6 +619,27 @@ fn info_package(package: &str, tlpdb: &HashMap<String, Package>) -> anyhow::Resu
     println!("Binfiles ({}):", pkg.binfiles.len());
     for file in &pkg.binfiles {
         println!("  {}", file);
+    }
+
+    Ok(())
+}
+
+fn search_packages(term: &str, tlpdb: &HashMap<String, Package>) -> anyhow::Result<()> {
+    let term_lower = term.to_lowercase();
+    let mut matches: Vec<&Package> = tlpdb
+        .values()
+        .filter(|pkg| pkg.name.to_lowercase().contains(&term_lower))
+        .collect();
+    
+    if matches.is_empty() {
+        println!("No packages found matching '{}'", term);
+        return Ok(());
+    }
+
+    matches.sort_by(|a, b| a.name.cmp(&b.name));
+    println!("Found {} packages matching '{}':", matches.len(), term);
+    for pkg in matches {
+        println!("  {} r{}", pkg.name, pkg.revision);
     }
 
     Ok(())
