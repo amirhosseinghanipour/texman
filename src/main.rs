@@ -248,13 +248,20 @@ fn resolve_dependencies(
     package: &str,
     tlpdb: &HashMap<String, Package>,
     resolved: &mut Vec<String>,
+    visited: &mut Vec<String>,
 ) -> anyhow::Result<()> {
     let pkg = tlpdb.get(package).ok_or_else(|| anyhow::anyhow!("Package {} not found", package))?;
+
+    if visited.contains(&pkg.name) && !resolved.contains(&pkg.name) {
+        anyhow::bail!("Circular dependency detected involving {}", pkg.name);
+    }
+
+    visited.push(pkg.name.clone());
 
     for dep in &pkg.depends {
         if !resolved.contains(dep) {
             log::debug!("Resolving dependency: {}", dep);
-            resolve_dependencies(dep, tlpdb, resolved)?;
+            resolve_dependencies(dep, tlpdb, resolved, visited)?;
             resolved.push(dep.clone());
         }
     }
@@ -320,7 +327,8 @@ async fn install_package(package: &str, profile: &str, tlpdb: &HashMap<String, P
     let conn = init_db(&texman_dir)?;
 
     let mut to_install = Vec::new();
-    resolve_dependencies(package, tlpdb, &mut to_install)?;
+    let mut visited = Vec::new();
+    resolve_dependencies(package, tlpdb, &mut to_install, &mut visited)?;
     log::info!("Packages to install: {:?}", to_install);
 
     let packages: Vec<Package> = to_install
