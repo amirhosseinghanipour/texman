@@ -1,5 +1,4 @@
 use clap::{Parser, Subcommand};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use flate2::read::GzDecoder;
 use std::fs::File;
@@ -19,10 +18,10 @@ enum Commands {
     },
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Debug)]
 struct Package {
     name: String,
-    version: String,
+    revision: String,
     url: String,
     depends: Vec<String>,
 }
@@ -45,36 +44,86 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn fetch_tlpdb() -> anyhow::Result<HashMap<String, Package>> {
-    log::info!("Fetching TLPDB from CTAN mirror");
-    let mock_response = r#"
-    {
-        "babel": {
-            "name": "babel",
-            "version": "3.9",
-            "url": "http://mirror.ctan.org/systems/texlive/tlnet/archive/babel.tar.xz",
-            "depends": ["texlive-core"]
-        },
-        "fontspec": {
-            "name": "fontspec",
-            "version": "2.7",
-            "url": "http://mirror.ctan.org/systems/texlive/tlnet/archive/fontspec.tar.xz",
-            "depends": ["texlive-core", "xetex"]
-        },
-        "texlive-core": {
-            "name": "texlive-core",
-            "version": "2023",
-            "url": "http://mirror.ctan.org/systems/texlive/tlnet/archive/texlive-core.tar.xz",
-            "depends": []
-        },
-        "xetex": {
-            "name": "xetex",
-            "version": "0.9999",
-            "url": "http://mirror.ctan.org/systems/texlive/tlnet/archive/xetex.tar.xz",
-            "depends": ["texlive-core"]
-        }
-    }"#;
+    let tlpdb_text = fetch_tlpdb_text().await?;
+    parse_tlpdb(&tlpdb_text)
+}
 
-    let packages: HashMap<String, Package> = serde_json::from_str(mock_response)?;
+async fn fetch_tlpdb_text() -> anyhow::Result<String> {
+    log::info!("Fetching TLPDB from CTAN mirror");
+    let url = "http://mirror.ctan.org/systems/texlive/tlnet/tlpkg/texlive.tlpdb";
+    let response = reqwest::get(url).await?;
+    let tlpdb_text = response.text().await?;
+    log::debug!("Fetched TLPDB ({} bytes)", tlpdb_text.len());
+    Ok(tlpdb_text)
+}
+
+fn parse_tlpdb(tlpdb_text: &str) -> anyhow::Result<HashMap<String, Package>> {
+    let mut packages = HashMap::new();
+    let mut current_pkg: Option<(String, Vec<String>, String)> = None;
+
+    for line in tlpdb_text.lines() {
+        if line.is_empty() && current_pkg.is_some() {
+            let (name, depends, revision) = current_pkg.take().unwrap();
+            let url = format!(
+                "http://mirror.ctan.org/systems/texlive/tlnet/archive/{}.tar.xz",
+                name
+            );
+            packages.insert(
+                name.clone(),
+                Package {
+                    name,
+                    revision,
+                    url,
+                    depends,
+                },
+            );
+        } else if line.starts_with("name ") {
+            if let Some((name, _, _)) = current_pkg.take() {
+                let url = format!(
+                    "http://mirror.ctan.org/systems/texlive/tlnet/archive/{}.tar.xz",
+                    name
+                );
+                packages.insert(
+                    name.clone(),
+                    Package {
+                        name,
+                        revision: "unknown".to_string(),
+                        url,
+                        depends: vec![],
+                    },
+                );
+            }
+            let name = line.strip_prefix("name ").unwrap().to_string();
+            current_pkg = Some((name, vec![], "unknown".to_string()));
+        } else if let Some((_, depends, revision)) = &mut current_pkg {
+            if line.starts_with("depends ") {
+                let deps = line.strip_prefix("depends ").unwrap();
+                if !deps.is_empty() {
+                    depends.extend(deps.split(',').map(|s| s.trim().to_string()));
+                }
+            } else if line.starts_with("revision ") {
+                *revision = line.strip_prefix("revision ").unwrap().to_string();
+            }
+        }
+    }
+
+    if let Some((name, depends, revision)) = current_pkg {
+        let url = format!(
+            "http://mirror.ctan.org/systems/texlive/tlnet/archive/{}.tar.xz",
+            name
+        );
+        packages.insert(
+            name.clone(),
+            Package {
+                name,
+                revision,
+                url,
+                depends,
+            },
+        );
+    }
+
+    log::info!("Parsed {} packages from TLPDB", packages.len());
     Ok(packages)
 }
 
@@ -102,7 +151,7 @@ fn resolve_dependencies(
 
 async fn download_package(pkg: &Package, texman_dir: &PathBuf) -> anyhow::Result<PathBuf> {
     let download_path = texman_dir.join(format!("{}.tar.xz", pkg.name));
-    log::info!("Downloading {} v{} from {}", pkg.name, pkg.version, pkg.url);
+    log::info!("Downloading {} r{} from {}", pkg.name, pkg.revision, pkg.url);
     let response = reqwest::get(&pkg.url).await?;
     let bytes = response.bytes().await?;
     std::fs::write(&download_path, bytes)?;
@@ -123,17 +172,17 @@ async fn install_package(package: &str, tlpdb: &HashMap<String, Package>) -> any
         let pkg = tlpdb.get(&pkg_name).unwrap();
         let download_path = download_package(pkg, &texman_dir).await?;
 
-        let store_path = texman_dir.join("store").join(format!("{}-{}", pkg.name, pkg.version));
+        let store_path = texman_dir.join("store").join(format!("{}-r{}", pkg.name, pkg.revision));
         std::fs::create_dir_all(&store_path)?;
 
-        log::info!("Installing {} v{} to {:?}", pkg.name, pkg.version, store_path);
+        log::info!("Installing {} r{} to {:?}", pkg.name, pkg.revision, store_path);
         let tar_gz = File::open(&download_path)?;
         let tar = GzDecoder::new(tar_gz);
         let mut archive = tar::Archive::new(tar);
         archive.unpack(&store_path)?;
 
         std::fs::remove_file(&download_path)?;
-        log::info!("Installed {} v{}", pkg.name, pkg.version);
+        log::info!("Installed {} r{}", pkg.name, pkg.revision);
     }
 
     Ok(())
