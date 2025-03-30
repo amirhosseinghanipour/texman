@@ -14,7 +14,7 @@ use std::io::Write;
 use rayon::prelude::*;
 
 #[derive(Parser)]
-#[command(name = "texman", about = "A Rust-based LaTeX package manager", version = "0.1.0")]
+#[command(name = "texman", about = "A Rust-based package manager for LaTeX", version = "0.1.0")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
