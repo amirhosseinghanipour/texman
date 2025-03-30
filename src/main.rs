@@ -50,6 +50,8 @@ struct Package {
     revision: String,
     url: String,
     depends: Vec<String>,
+    runfiles: Vec<String>,
+    binfiles: Vec<String>,
 }
 
 #[tokio::main]
@@ -144,11 +146,14 @@ async fn fetch_tlpdb_text() -> anyhow::Result<String> {
 
 fn parse_tlpdb(tlpdb_text: &str) -> anyhow::Result<HashMap<String, Package>> {
     let mut packages = HashMap::new();
-    let mut current_pkg: Option<(String, Vec<String>, String)> = None;
+    let mut current_pkg: Option<(String, Vec<String>, String, Vec<String>, Vec<String>)> = None;
+
+    let mut in_runfiles = false;
+    let mut in_binfiles = false;
 
     for line in tlpdb_text.lines() {
         if line.is_empty() && current_pkg.is_some() {
-            let (name, depends, revision) = current_pkg.take().unwrap();
+            let (name, depends, revision, runfiles, binfiles) = current_pkg.take().unwrap();
             let url = format!(
                 "http://mirror.ctan.org/systems/texlive/tlnet/archive/{}.tar.xz",
                 name
@@ -160,10 +165,14 @@ fn parse_tlpdb(tlpdb_text: &str) -> anyhow::Result<HashMap<String, Package>> {
                     revision,
                     url,
                     depends,
+                    runfiles,
+                    binfiles,
                 },
             );
+            in_runfiles = false;
+            in_binfiles = false;
         } else if line.starts_with("name ") {
-            if let Some((name, _, _)) = current_pkg.take() {
+            if let Some((name, _, _, _, _)) = current_pkg.take() {
                 let url = format!(
                     "http://mirror.ctan.org/systems/texlive/tlnet/archive/{}.tar.xz",
                     name
@@ -175,24 +184,45 @@ fn parse_tlpdb(tlpdb_text: &str) -> anyhow::Result<HashMap<String, Package>> {
                         revision: "unknown".to_string(),
                         url,
                         depends: vec![],
+                        runfiles: vec![],
+                        binfiles: vec![],
                     },
                 );
             }
             let name = line.strip_prefix("name ").unwrap().to_string();
-            current_pkg = Some((name, vec![], "unknown".to_string()));
-        } else if let Some((_, depends, revision)) = &mut current_pkg {
-            if line.starts_with("depends ") {
+            current_pkg = Some((name, vec![], "unknown".to_string(), vec![], vec![]));
+            in_runfiles = false;
+            in_binfiles = false;
+        } else if let Some((_, depends, revision, runfiles, binfiles)) = &mut current_pkg {
+            if line == "runfiles" {
+                in_runfiles = true;
+                in_binfiles = false;
+            } else if line == "binfiles" {
+                in_runfiles = false;
+                in_binfiles = true;
+            } else if line.starts_with("depends ") {
                 let deps = line.strip_prefix("depends ").unwrap();
                 if !deps.is_empty() {
                     depends.extend(deps.split(',').map(|s| s.trim().to_string()));
                 }
+                in_runfiles = false;
+                in_binfiles = false;
             } else if line.starts_with("revision ") {
                 *revision = line.strip_prefix("revision ").unwrap().to_string();
+                in_runfiles = false;
+                in_binfiles = false;
+            } else if in_runfiles && line.starts_with(" ") {
+                runfiles.push(line.trim().to_string());
+            } else if in_binfiles && line.starts_with(" ") {
+                binfiles.push(line.trim().to_string());
+            } else {
+                in_runfiles = false;
+                in_binfiles = false;
             }
         }
     }
 
-    if let Some((name, depends, revision)) = current_pkg {
+    if let Some((name, depends, revision, runfiles, binfiles)) = current_pkg {
         let url = format!(
             "http://mirror.ctan.org/systems/texlive/tlnet/archive/{}.tar.xz",
             name
@@ -204,6 +234,8 @@ fn parse_tlpdb(tlpdb_text: &str) -> anyhow::Result<HashMap<String, Package>> {
                 revision,
                 url,
                 depends,
+                runfiles,
+                binfiles,
             },
         );
     }
@@ -235,9 +267,44 @@ fn resolve_dependencies(
 }
 
 async fn download_package(pkg: &Package, texman_dir: &PathBuf) -> anyhow::Result<PathBuf> {
-    let download_path = texman_dir.join(format!("{}.tar.xz", pkg.name));
-    log::info!("Downloading {} r{} from {}", pkg.name, pkg.revision, pkg.url);
-    let response = reqwest::get(&pkg.url).await?;
+    let platform = std::env::consts::ARCH;
+    let os = std::env::consts::OS;
+    let platform_suffix = match (platform, os) {
+        ("x86_64", "linux") => "x86_64-linux",
+        ("x86_64", "macos") => "x86_64-darwin",
+        _ => "", 
+    };
+
+    let mut archive_name = format!("{}.tar.xz", pkg.name);
+    let mut url = pkg.url.clone();
+
+    for file in &pkg.binfiles {
+        if file.ends_with(&format!("{}.{}.tar.xz", pkg.name, platform_suffix)) {
+            archive_name = format!("{}.{}.tar.xz", pkg.name, platform_suffix);
+            url = format!(
+                "http://mirror.ctan.org/systems/texlive/tlnet/archive/{}",
+                archive_name
+            );
+            break;
+        }
+    }
+
+    if url == pkg.url {
+        for file in &pkg.runfiles {
+            if file.ends_with(&format!("{}.tar.xz", pkg.name)) {
+                archive_name = format!("{}.tar.xz", pkg.name);
+                url = format!(
+                    "http://mirror.ctan.org/systems/texlive/tlnet/archive/{}",
+                    archive_name
+                );
+                break;
+            }
+        }
+    }
+
+    let download_path = texman_dir.join(&archive_name);
+    log::info!("Downloading {} r{} from {}", pkg.name, pkg.revision, url);
+    let response = reqwest::get(&url).await?;
     let bytes = response.bytes().await?;
     std::fs::write(&download_path, bytes)?;
     Ok(download_path)
