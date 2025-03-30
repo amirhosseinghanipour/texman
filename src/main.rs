@@ -11,6 +11,7 @@ use tar;
 use rusqlite::{Connection, params, OptionalExtension};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::io::Write;
+use rayon::prelude::*;
 
 #[derive(Parser)]
 #[command(name = "texman", about = "A Rust-based LaTeX package manager", version = "0.1.0")]
@@ -35,13 +36,24 @@ enum Commands {
         package: String,
     },
     Backup {
-        name: String,
+        #[command(subcommand)]
+        action: BackupAction,
     },
     Restore {
         name: String,
     },
     Search {
         term: String,
+        #[arg(long)]
+        description: bool,
+        #[arg(long)]
+        depends: bool,
+        #[arg(long)]
+        longdesc: bool,
+    },
+    Clean {
+        #[arg(long)]
+        backups: bool,
     },
     Profile {
         #[command(subcommand)]
@@ -51,15 +63,20 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum ProfileAction {
-    Create {
-        name: String,
-    },
-    Switch {
-        name: String,
-    },
+    Create { name: String },
+    Switch { name: String },
+    List,
+    Remove { name: String },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Subcommand)]
+enum BackupAction {
+    Create { name: String },
+    List,
+    Remove { name: String },
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct Package {
     name: String,
     revision: String,
@@ -67,6 +84,8 @@ struct Package {
     depends: Vec<String>,
     runfiles: Vec<String>,
     binfiles: Vec<String>,
+    description: Option<String>,
+    longdesc: Option<String>,
 }
 
 #[tokio::main]
@@ -97,21 +116,43 @@ async fn main() -> anyhow::Result<()> {
             log::info!("Showing info for package: {}", package);
             info_package(&package, &tlpdb)?;
         }
-        Commands::Backup { name } => {
-            log::info!("Backing up active profile to '{}'", name);
-            backup_profile(&name)?;
-        }
+        Commands::Backup { action } => match action {
+            BackupAction::Create { name } => {
+                log::info!("Backing up active profile to '{}'", name);
+                backup_profile(&name)?;
+            }
+            BackupAction::List => {
+                log::info!("Listing all backups");
+                list_backups()?;
+            }
+            BackupAction::Remove { name } => {
+                log::info!("Removing backup '{}'", name);
+                remove_backup(&name)?;
+            }
+        },
         Commands::Restore { name } => {
             log::info!("Restoring active profile from backup '{}'", name);
             restore_profile(&name)?;
         }
-        Commands::Search { term } => {
+        Commands::Search { term, description, depends, longdesc } => {
             log::info!("Searching for packages matching '{}'", term);
-            search_packages(&term, &tlpdb)?;
+            search_packages(&term, &tlpdb, description, depends, longdesc)?;
+        }
+        Commands::Clean { backups } => {
+            log::info!("Cleaning up unused files{}", if backups { " and backups" } else { "" });
+            clean(backups)?;
         }
         Commands::Profile { action } => match action {
             ProfileAction::Create { name } => create_profile(&name)?,
             ProfileAction::Switch { name } => switch_profile(&name)?,
+            ProfileAction::List => {
+                log::info!("Listing all profiles");
+                list_profiles()?;
+            }
+            ProfileAction::Remove { name } => {
+                log::info!("Removing profile '{}'", name);
+                remove_profile(&name)?;
+            }
         },
     }
 
@@ -136,6 +177,7 @@ fn init_db(texman_dir: &PathBuf) -> anyhow::Result<Connection> {
             profile TEXT NOT NULL,
             name TEXT NOT NULL,
             revision TEXT NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
             PRIMARY KEY (backup_name, name)
         )",
         [],
@@ -149,6 +191,7 @@ async fn fetch_tlpdb() -> anyhow::Result<HashMap<String, Package>> {
         .join(".texman");
     let db_dir = texman_dir.join("db");
     let tlpdb_path = db_dir.join("tlpdb.txt");
+    let tlpdb_bin_path = db_dir.join("tlpdb.bin");
 
     std::fs::create_dir_all(&db_dir)?;
 
@@ -163,6 +206,14 @@ async fn fetch_tlpdb() -> anyhow::Result<HashMap<String, Package>> {
         true
     };
 
+    if !should_fetch && tlpdb_bin_path.exists() {
+        let bin_file = File::open(&tlpdb_bin_path)?;
+        let tlpdb: HashMap<String, Package> = bincode::deserialize_from(bin_file)
+            .map_err(|e| anyhow::anyhow!("Failed to deserialize TLPDB: {}", e))?;
+        log::info!("Loaded cached TLPDB from {:?}", tlpdb_bin_path);
+        return Ok(tlpdb);
+    }
+
     let tlpdb_text = if should_fetch {
         log::info!("Fetching fresh TLPDB from CTAN mirror");
         let text = fetch_tlpdb_text().await?;
@@ -174,7 +225,13 @@ async fn fetch_tlpdb() -> anyhow::Result<HashMap<String, Package>> {
         fs::read_to_string(&tlpdb_path)?
     };
 
-    parse_tlpdb(&tlpdb_text)
+    let tlpdb = parse_tlpdb(&tlpdb_text)?;
+    let bin_file = File::create(&tlpdb_bin_path)?;
+    bincode::serialize_into(bin_file, &tlpdb)
+        .map_err(|e| anyhow::anyhow!("Failed to serialize TLPDB: {}", e))?;
+    log::info!("Saved serialized TLPDB to {:?}", tlpdb_bin_path);
+
+    Ok(tlpdb)
 }
 
 async fn fetch_tlpdb_text() -> anyhow::Result<String> {
@@ -204,80 +261,86 @@ async fn fetch_tlpdb_text() -> anyhow::Result<String> {
 }
 
 fn parse_tlpdb(tlpdb_text: &str) -> anyhow::Result<HashMap<String, Package>> {
-    let mut packages = HashMap::with_capacity(9000); 
-    let mut current_pkg: Option<Package> = None;
-    let mut in_runfiles = false;
-    let mut in_binfiles = false;
+    let blocks: Vec<&str> = tlpdb_text.split("\n\n").filter(|b| !b.trim().is_empty()).collect();
+    let packages: Vec<Package> = blocks.par_iter().filter_map(|block| {
+        let mut pkg = Package {
+            name: String::new(),
+            revision: "unknown".to_string(),
+            url: String::new(),
+            depends: Vec::new(),
+            runfiles: Vec::new(),
+            binfiles: Vec::new(),
+            description: None,
+            longdesc: None,
+        };
+        let mut in_runfiles = false;
+        let mut in_binfiles = false;
+        let mut in_longdesc = false;
+        let mut longdesc_lines = Vec::new();
 
-    for line in tlpdb_text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            if let Some(pkg) = current_pkg.take() {
-                packages.insert(pkg.name.clone(), pkg);
+        for line in block.lines() {
+            let line = line.trim();
+            if in_longdesc {
+                if line.is_empty() || line.starts_with("name ") {
+                    in_longdesc = false;
+                    pkg.longdesc = Some(longdesc_lines.join("\n"));
+                    longdesc_lines.clear();
+                } else {
+                    longdesc_lines.push(line.to_string());
+                    continue;
+                }
             }
-            in_runfiles = false;
-            in_binfiles = false;
-            continue;
+
+            if line.starts_with("name ") {
+                pkg.name = line[5..].to_string();
+                pkg.url = format!("http://mirror.ctan.org/systems/texlive/tlnet/archive/{}.tar.xz", pkg.name);
+            } else if line == "runfiles" {
+                in_runfiles = true;
+                in_binfiles = false;
+            } else if line == "binfiles" {
+                in_runfiles = false;
+                in_binfiles = true;
+            } else if line.starts_with("depends ") {
+                let deps = &line[8..];
+                if !deps.is_empty() {
+                    pkg.depends.extend(deps.split(',').map(|s| s.trim().to_string()));
+                }
+                in_runfiles = false;
+                in_binfiles = false;
+            } else if line.starts_with("revision ") {
+                pkg.revision = line[9..].to_string();
+                in_runfiles = false;
+                in_binfiles = false;
+            } else if line.starts_with("shortdesc ") {
+                pkg.description = Some(line[10..].to_string());
+                in_runfiles = false;
+                in_binfiles = false;
+            } else if line.starts_with("longdesc ") {
+                in_longdesc = true;
+                longdesc_lines.push(line[9..].to_string());
+                in_runfiles = false;
+                in_binfiles = false;
+            } else if in_runfiles && line.starts_with(' ') {
+                pkg.runfiles.push(line.trim_start().to_string());
+            } else if in_binfiles && line.starts_with(' ') {
+                pkg.binfiles.push(line.trim_start().to_string());
+            }
         }
 
-        if line.starts_with("name ") {
-            if let Some(pkg) = current_pkg.take() {
-                packages.insert(pkg.name.clone(), pkg);
-            }
-            let name = line[5..].to_string();
-            current_pkg = Some(Package {
-                name: name.clone(),
-                revision: "unknown".to_string(),
-                url: format!("http://mirror.ctan.org/systems/texlive/tlnet/archive/{}.tar.xz", name),
-                depends: Vec::new(),
-                runfiles: Vec::new(),
-                binfiles: Vec::new(),
-            });
-            in_runfiles = false;
-            in_binfiles = false;
-        } else if let Some(ref mut pkg) = current_pkg {
-            match line {
-                "runfiles" => {
-                    in_runfiles = true;
-                    in_binfiles = false;
-                }
-                "binfiles" => {
-                    in_runfiles = false;
-                    in_binfiles = true;
-                }
-                _ if line.starts_with("depends ") => {
-                    let deps = &line[8..];
-                    if !deps.is_empty() {
-                        pkg.depends.extend(deps.split(',').map(|s| s.trim().to_string()));
-                    }
-                    in_runfiles = false;
-                    in_binfiles = false;
-                }
-                _ if line.starts_with("revision ") => {
-                    pkg.revision = line[9..].to_string();
-                    in_runfiles = false;
-                    in_binfiles = false;
-                }
-                _ if in_runfiles && line.starts_with(' ') => {
-                    pkg.runfiles.push(line.trim_start().to_string());
-                }
-                _ if in_binfiles && line.starts_with(' ') => {
-                    pkg.binfiles.push(line.trim_start().to_string());
-                }
-                _ => {
-                    in_runfiles = false;
-                    in_binfiles = false;
-                }
-            }
+        if in_longdesc && !longdesc_lines.is_empty() {
+            pkg.longdesc = Some(longdesc_lines.join("\n"));
         }
+
+        if pkg.name.is_empty() { None } else { Some(pkg) }
+    }).collect();
+
+    let mut tlpdb = HashMap::with_capacity(packages.len());
+    for pkg in packages {
+        tlpdb.insert(pkg.name.clone(), pkg);
     }
 
-    if let Some(pkg) = current_pkg {
-        packages.insert(pkg.name.clone(), pkg);
-    }
-
-    log::info!("Parsed {} packages from TLPDB", packages.len());
-    Ok(packages)
+    log::info!("Parsed {} packages from TLPDB", tlpdb.len());
+    Ok(tlpdb)
 }
 
 fn resolve_dependencies(
@@ -612,6 +675,12 @@ fn info_package(package: &str, tlpdb: &HashMap<String, Package>) -> anyhow::Resu
     println!("Default URL: {}", pkg.url);
     let deps_str = if pkg.depends.is_empty() { "None".to_string() } else { pkg.depends.join(", ") };
     println!("Dependencies: {}", deps_str);
+    if let Some(desc) = &pkg.description {
+        println!("Short Description: {}", desc);
+    }
+    if let Some(longdesc) = &pkg.longdesc {
+        println!("Long Description: {}", longdesc);
+    }
     println!("Runfiles ({}):", pkg.runfiles.len());
     for file in &pkg.runfiles {
         println!("  {}", file);
@@ -624,11 +693,17 @@ fn info_package(package: &str, tlpdb: &HashMap<String, Package>) -> anyhow::Resu
     Ok(())
 }
 
-fn search_packages(term: &str, tlpdb: &HashMap<String, Package>) -> anyhow::Result<()> {
+fn search_packages(term: &str, tlpdb: &HashMap<String, Package>, search_desc: bool, search_deps: bool, search_longdesc: bool) -> anyhow::Result<()> {
     let term_lower = term.to_lowercase();
     let mut matches: Vec<&Package> = tlpdb
         .values()
-        .filter(|pkg| pkg.name.to_lowercase().contains(&term_lower))
+        .filter(|pkg| {
+            let name_match = pkg.name.to_lowercase().contains(&term_lower);
+            let desc_match = search_desc && pkg.description.as_ref().map_or(false, |d| d.to_lowercase().contains(&term_lower));
+            let longdesc_match = search_longdesc && pkg.longdesc.as_ref().map_or(false, |d| d.to_lowercase().contains(&term_lower));
+            let deps_match = search_deps && pkg.depends.iter().any(|d| d.to_lowercase().contains(&term_lower));
+            name_match || desc_match || longdesc_match || deps_match
+        })
         .collect();
     
     if matches.is_empty() {
@@ -640,6 +715,15 @@ fn search_packages(term: &str, tlpdb: &HashMap<String, Package>) -> anyhow::Resu
     println!("Found {} packages matching '{}':", matches.len(), term);
     for pkg in matches {
         println!("  {} r{}", pkg.name, pkg.revision);
+        if search_desc && pkg.description.is_some() {
+            println!("    Short Description: {}", pkg.description.as_ref().unwrap());
+        }
+        if search_longdesc && pkg.longdesc.is_some() {
+            println!("    Long Description: {}", pkg.longdesc.as_ref().unwrap());
+        }
+        if search_deps && !pkg.depends.is_empty() {
+            println!("    Depends: {}", pkg.depends.join(", "));
+        }
     }
 
     Ok(())
@@ -671,6 +755,76 @@ fn switch_profile(name: &str) -> anyhow::Result<()> {
     }
     std::os::unix::fs::symlink(&profile_path, &active_path)?;
     log::info!("Switched to profile: {}", name);
+    Ok(())
+}
+
+fn list_profiles() -> anyhow::Result<()> {
+    let texman_dir = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?
+        .join(".texman");
+    let profiles_dir = texman_dir.join("profiles");
+    let active_path = texman_dir.join("active");
+
+    if !profiles_dir.exists() {
+        println!("No profiles found.");
+        return Ok(());
+    }
+
+    let mut profiles = Vec::new();
+    for entry in fs::read_dir(&profiles_dir)? {
+        let entry = entry?;
+        let name = entry.file_name().into_string().unwrap();
+        profiles.push(name);
+    }
+
+    if profiles.is_empty() {
+        println!("No profiles found.");
+        return Ok(());
+    }
+
+    let active_profile = if active_path.exists() {
+        active_path.read_link()?
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+    } else {
+        String::new()
+    };
+
+    println!("Available profiles:");
+    for profile in profiles {
+        let active_mark = if profile == active_profile { " (active)" } else { "" };
+        println!("  {}{}", profile, active_mark);
+    }
+
+    Ok(())
+}
+
+fn remove_profile(name: &str) -> anyhow::Result<()> {
+    let texman_dir = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?
+        .join(".texman");
+    let profile_path = texman_dir.join("profiles").join(name);
+    let active_path = texman_dir.join("active");
+
+    if !profile_path.exists() {
+        anyhow::bail!("Profile '{}' does not exist.", name);
+    }
+
+    if active_path.exists() && active_path.read_link()?.file_name().unwrap().to_str().unwrap() == name {
+        anyhow::bail!("Cannot remove active profile '{}'. Switch to another profile first.", name);
+    }
+
+    fs::remove_dir_all(&profile_path)?;
+    let conn = init_db(&texman_dir)?;
+    conn.execute(
+        "DELETE FROM installed_packages WHERE profile = ?1",
+        params![name],
+    )?;
+    log::info!("Removed profile '{}'", name);
+
     Ok(())
 }
 
@@ -789,5 +943,92 @@ fn restore_profile(name: &str) -> anyhow::Result<()> {
     }
 
     log::info!("Restored profile '{}' from backup '{}'", active_profile, name);
+    Ok(())
+}
+
+fn list_backups() -> anyhow::Result<()> {
+    let texman_dir = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?
+        .join(".texman");
+    let conn = init_db(&texman_dir)?;
+
+    let mut stmt = conn.prepare("SELECT backup_name, MIN(created_at), COUNT(name) FROM backups GROUP BY backup_name ORDER BY backup_name")?;
+    let backups = stmt.query_map([], |row| {
+        let name: String = row.get(0)?;
+        let timestamp: i64 = row.get(1)?;
+        let pkg_count: i64 = row.get(2)?;
+        Ok((name, timestamp, pkg_count))
+    })?;
+
+    let mut backup_list = Vec::new();
+    for backup in backups {
+        backup_list.push(backup?);
+    }
+
+    if backup_list.is_empty() {
+        println!("No backups found.");
+        return Ok(());
+    }
+
+    println!("Available backups:");
+    for (name, timestamp, pkg_count) in backup_list {
+        let dt = DateTime::<Utc>::from_timestamp(timestamp, 0)
+            .unwrap()
+            .format("%Y-%m-%d %H:%M:%S UTC")
+            .to_string();
+        println!("  {} (created: {}, packages: {})", name, dt, pkg_count);
+    }
+
+    Ok(())
+}
+
+fn remove_backup(name: &str) -> anyhow::Result<()> {
+    let texman_dir = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?
+        .join(".texman");
+    let backup_dir = texman_dir.join("backups").join(name);
+
+    if !backup_dir.exists() {
+        anyhow::bail!("Backup '{}' does not exist.", name);
+    }
+
+    fs::remove_dir_all(&backup_dir)?;
+    let conn = init_db(&texman_dir)?;
+    conn.execute("DELETE FROM backups WHERE backup_name = ?1", params![name])?;
+    log::info!("Removed backup '{}'", name);
+
+    Ok(())
+}
+
+fn clean(remove_backups: bool) -> anyhow::Result<()> {
+    let texman_dir = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?
+        .join(".texman");
+
+    let mut removed_files = 0;
+    for entry in fs::read_dir(&texman_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("xz") {
+            fs::remove_file(&path)?;
+            removed_files += 1;
+            log::debug!("Removed unused file: {:?}", path);
+        }
+    }
+    log::info!("Removed {} unused .tar.xz files", removed_files);
+
+    if remove_backups {
+        let backups_dir = texman_dir.join("backups");
+        if backups_dir.exists() {
+            fs::remove_dir_all(&backups_dir)?;
+            fs::create_dir_all(&backups_dir)?;
+            let conn = init_db(&texman_dir)?;
+            conn.execute("DELETE FROM backups", [])?;
+            log::info!("Removed all backups");
+        } else {
+            log::info!("No backups to remove");
+        }
+    }
+
     Ok(())
 }
