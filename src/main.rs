@@ -7,7 +7,7 @@ use std::fs;
 use futures::future::join_all;
 use xz2::read::XzDecoder;
 use tar;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, params, OptionalExtension};
 
 #[derive(Parser)]
 #[command(name = "texman", about = "A Rust-based LaTeX package manager", version = "0.1.0")]
@@ -25,6 +25,9 @@ enum Commands {
     },
     Update,
     List,
+    Remove {
+        package: String,
+    },
     Profile {
         #[command(subcommand)]
         action: ProfileAction,
@@ -68,6 +71,10 @@ async fn main() -> anyhow::Result<()> {
         Commands::List => {
             log::info!("Listing installed packages in active profile");
             list_packages()?;
+        }
+        Commands::Remove { package } => {
+            log::info!("Removing package: {}", package);
+            remove_package(&package)?;
         }
         Commands::Profile { action } => match action {
             ProfileAction::Create { name } => create_profile(&name)?,
@@ -293,6 +300,47 @@ async fn install_package(package: &str, profile: &str, tlpdb: &HashMap<String, P
     if !active_path.exists() {
         std::os::unix::fs::symlink(&profile_dir, &active_path)?;
         log::info!("Set {} as active profile", profile);
+    }
+
+    Ok(())
+}
+
+fn remove_package(package: &str) -> anyhow::Result<()> {
+    let texman_dir = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?
+        .join(".texman");
+    let active_path = texman_dir.join("active");
+
+    if !active_path.exists() {
+        anyhow::bail!("No active profile set. Install a package or switch to a profile first.");
+    }
+
+    let conn = init_db(&texman_dir)?;
+    let active_dir = fs::canonicalize(&active_path)?;
+    let active_profile = active_path.read_link()?
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let mut stmt = conn.prepare("SELECT revision FROM installed_packages WHERE profile = ?1 AND name = ?2")?;
+    let revision: Option<String> = stmt.query_row(params![active_profile, package], |row| row.get(0)).optional()?;
+
+    if let Some(revision) = revision {
+        let store_path = active_dir.join(format!("{}-r{}", package, revision));
+        if store_path.exists() {
+            fs::remove_dir_all(&store_path)?;
+            log::info!("Removed files for {} r{}", package, revision);
+        }
+
+        conn.execute(
+            "DELETE FROM installed_packages WHERE profile = ?1 AND name = ?2",
+            params![active_profile, package],
+        )?;
+        log::info!("Removed {} from profile '{}'", package, active_profile);
+    } else {
+        log::warn!("Package {} not found in profile '{}'", package, active_profile);
     }
 
     Ok(())
