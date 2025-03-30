@@ -2,6 +2,13 @@
 name = "texman"
 version = "0.1.0"
 edition = "2024"
+authors = ["Amirhossein Ghanipour amirhosseinghanipour@gmail.com"]
+license = "CC-BY-NC-4.0"
+keywords = ["latex", "tex", "texlive", "texman"]
+repository = "https://github.com/amirhosseinghanipour/texman"
+documentation = "https://docs.rs/texman/0.1.0"
+categories = ["latex"]
+readme = "README.md"
 
 [dependencies]
 anyhow = "1.0.97"
