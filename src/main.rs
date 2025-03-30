@@ -1,8 +1,12 @@
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
-use flate2::read::GzDecoder;
 use std::fs::File;
 use std::path::PathBuf;
+use chrono::{DateTime, Utc, Duration};
+use std::fs;
+use futures::future::join_all;
+use xz2::read::XzDecoder;
+use tar;
 
 #[derive(Parser)]
 #[command(name = "texman", about = "A Rust-based LaTeX package manager", version = "0.1.0")]
@@ -15,10 +19,26 @@ struct Cli {
 enum Commands {
     Install {
         package: String,
+        #[arg(long, default_value = "default")]
+        profile: String,
+    },
+    Profile {
+        #[command(subcommand)]
+        action: ProfileAction,
     },
 }
 
-#[derive(Debug)]
+#[derive(Subcommand)]
+enum ProfileAction {
+    Create {
+        name: String,
+    },
+    Switch {
+        name: String,
+    },
+}
+
+#[derive(Debug, Clone)]
 struct Package {
     name: String,
     revision: String,
@@ -34,22 +54,54 @@ async fn main() -> anyhow::Result<()> {
     let tlpdb = fetch_tlpdb().await?;
 
     match cli.command {
-        Commands::Install { package } => {
-            log::info!("Installing package: {}", package);
-            install_package(&package, &tlpdb).await?;
+        Commands::Install { package, profile } => {
+            log::info!("Installing package: {} into profile: {}", package, profile);
+            install_package(&package, &profile, &tlpdb).await?;
         }
+        Commands::Profile { action } => match action {
+            ProfileAction::Create { name } => create_profile(&name)?,
+            ProfileAction::Switch { name } => switch_profile(&name)?,
+        },
     }
 
     Ok(())
 }
 
 async fn fetch_tlpdb() -> anyhow::Result<HashMap<String, Package>> {
-    let tlpdb_text = fetch_tlpdb_text().await?;
+    let texman_dir = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?
+        .join(".texman");
+    let db_dir = texman_dir.join("db");
+    let tlpdb_path = db_dir.join("tlpdb.txt");
+
+    std::fs::create_dir_all(&db_dir)?;
+
+    let should_fetch = if tlpdb_path.exists() {
+        let metadata = fs::metadata(&tlpdb_path)?;
+        let modified = metadata.modified()?;
+        let last_modified: DateTime<Utc> = modified.into();
+        let now = Utc::now();
+        let age = now - last_modified;
+        age > Duration::hours(24)
+    } else {
+        true
+    };
+
+    let tlpdb_text = if should_fetch {
+        log::info!("Fetching fresh TLPDB from CTAN mirror");
+        let text = fetch_tlpdb_text().await?;
+        fs::write(&tlpdb_path, &text)?;
+        log::info!("Cached TLPDB at {:?}", tlpdb_path);
+        text
+    } else {
+        log::info!("Using cached TLPDB from {:?}", tlpdb_path);
+        fs::read_to_string(&tlpdb_path)?
+    };
+
     parse_tlpdb(&tlpdb_text)
 }
 
 async fn fetch_tlpdb_text() -> anyhow::Result<String> {
-    log::info!("Fetching TLPDB from CTAN mirror");
     let url = "http://mirror.ctan.org/systems/texlive/tlnet/tlpkg/texlive.tlpdb";
     let response = reqwest::get(url).await?;
     let tlpdb_text = response.text().await?;
@@ -158,32 +210,86 @@ async fn download_package(pkg: &Package, texman_dir: &PathBuf) -> anyhow::Result
     Ok(download_path)
 }
 
-async fn install_package(package: &str, tlpdb: &HashMap<String, Package>) -> anyhow::Result<()> {
+async fn install_package(package: &str, profile: &str, tlpdb: &HashMap<String, Package>) -> anyhow::Result<()> {
     let texman_dir = dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?
         .join(".texman");
-    std::fs::create_dir_all(&texman_dir)?;
+    let profile_dir = texman_dir.join("profiles").join(profile);
+    std::fs::create_dir_all(&profile_dir)?;
 
     let mut to_install = Vec::new();
     resolve_dependencies(package, tlpdb, &mut to_install)?;
     log::info!("Packages to install: {:?}", to_install);
 
-    for pkg_name in to_install {
-        let pkg = tlpdb.get(&pkg_name).unwrap();
-        let download_path = download_package(pkg, &texman_dir).await?;
+    let packages: Vec<Package> = to_install
+        .iter()
+        .map(|pkg_name| tlpdb.get(pkg_name).unwrap().clone())
+        .collect();
 
-        let store_path = texman_dir.join("store").join(format!("{}-r{}", pkg.name, pkg.revision));
+    let download_tasks: Vec<_> = packages
+        .iter()
+        .map(|pkg| {
+            let pkg = pkg.clone();
+            let texman_dir = texman_dir.clone();
+            tokio::spawn(async move { download_package(&pkg, &texman_dir).await })
+        })
+        .collect();
+
+    let download_results = join_all(download_tasks).await;
+    let download_paths: Vec<PathBuf> = download_results
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for (pkg, download_path) in packages.iter().zip(download_paths.iter()) {
+        let store_path = profile_dir.join(format!("{}-r{}", pkg.name, pkg.revision));
         std::fs::create_dir_all(&store_path)?;
 
         log::info!("Installing {} r{} to {:?}", pkg.name, pkg.revision, store_path);
-        let tar_gz = File::open(&download_path)?;
-        let tar = GzDecoder::new(tar_gz);
+        let tar_xz = File::open(download_path)?;
+        let tar = XzDecoder::new(tar_xz);
         let mut archive = tar::Archive::new(tar);
         archive.unpack(&store_path)?;
 
-        std::fs::remove_file(&download_path)?;
+        std::fs::remove_file(download_path)?;
         log::info!("Installed {} r{}", pkg.name, pkg.revision);
     }
 
+    let active_path = texman_dir.join("active");
+    if !active_path.exists() {
+        std::os::unix::fs::symlink(&profile_dir, &active_path)?;
+        log::info!("Set {} as active profile", profile);
+    }
+
+    Ok(())
+}
+
+fn create_profile(name: &str) -> anyhow::Result<()> {
+    let texman_dir = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?
+        .join(".texman");
+    let profile_path = texman_dir.join("profiles").join(name);
+    std::fs::create_dir_all(&profile_path)?;
+    log::info!("Created profile: {}", name);
+    Ok(())
+}
+
+fn switch_profile(name: &str) -> anyhow::Result<()> {
+    let texman_dir = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?
+        .join(".texman");
+    let profile_path = texman_dir.join("profiles").join(name);
+    let active_path = texman_dir.join("active");
+
+    if !profile_path.exists() {
+        anyhow::bail!("Profile {} does not exist", name);
+    }
+
+    if active_path.exists() {
+        std::fs::remove_file(&active_path)?;
+    }
+    std::os::unix::fs::symlink(&profile_path, &active_path)?;
+    log::info!("Switched to profile: {}", name);
     Ok(())
 }
